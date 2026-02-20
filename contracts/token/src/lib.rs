@@ -15,8 +15,10 @@ pub enum DataKey {
     Symbol,
     Decimals,
     TotalSupply,
+    MaxSupply,
     Balance(Address),
     Allowance(Address, Address), // (owner, spender)
+    Frozen(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -44,10 +46,17 @@ impl TokenContract {
         name: String,
         symbol: String,
         initial_supply: i128,
+        max_supply: Option<i128>,
     ) {
         // Prevent re-initialization
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
+        }
+
+        if let Some(cap) = max_supply {
+            assert!(cap > 0, "max_supply must be positive");
+            assert!(initial_supply <= cap, "initial_supply exceeds max_supply");
+            env.storage().instance().set(&DataKey::MaxSupply, &cap);
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -96,14 +105,27 @@ impl TokenContract {
         env.storage().instance().remove(&DataKey::PendingAdmin);
     }
 
+    /// Freeze an account, preventing it from sending tokens. Admin only.
+    pub fn freeze_account(env: Env, addr: Address) {
+        Self::_require_admin(&env);
+        env.storage().persistent().set(&DataKey::Frozen(addr.clone()), &true);
+        env.events().publish((symbol_short!("freeze"), addr), true);
+    }
+
+    /// Unfreeze a previously frozen account. Admin only.
+    pub fn unfreeze_account(env: Env, addr: Address) {
+        Self::_require_admin(&env);
+        env.storage().persistent().remove(&DataKey::Frozen(addr.clone()));
+        env.events().publish((symbol_short!("freeze"), addr), false);
+    }
+
     // ── Token operations ────────────────────────────────────────────────
 
     /// Transfer `amount` from `from` to `to`. Caller must be `from`.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         assert!(amount > 0, "amount must be positive");
-
-        // TODO (issue #1): check freeze status of `from` here
+        assert!(!Self::_is_frozen(&env, &from), "account is frozen");
 
         Self::_transfer(&env, &from, &to, amount);
     }
@@ -126,6 +148,7 @@ impl TokenContract {
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
         assert!(amount > 0, "amount must be positive");
+        assert!(!Self::_is_frozen(&env, &from), "account is frozen");
 
         let key = DataKey::Allowance(from.clone(), spender.clone());
         let allowance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -168,6 +191,15 @@ impl TokenContract {
         env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0)
     }
 
+    /// Returns `true` if the given address is frozen.
+    pub fn is_frozen(env: Env, addr: Address) -> bool {
+        env.storage().persistent().get(&DataKey::Frozen(addr)).unwrap_or(false)
+    }
+  
+    pub fn max_supply(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::MaxSupply)
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────
 
     fn _require_admin(env: &Env) {
@@ -175,13 +207,23 @@ impl TokenContract {
         admin.require_auth();
     }
 
+    fn _is_frozen(env: &Env, addr: &Address) -> bool {
+        env.storage().persistent().get(&DataKey::Frozen(addr.clone())).unwrap_or(false)
+    }
+
     fn _mint(env: &Env, to: &Address, amount: i128) {
+        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+        let new_supply = supply + amount;
+
+        if let Some(cap) = env.storage().instance().get::<DataKey, i128>(&DataKey::MaxSupply) {
+            assert!(new_supply <= cap, "mint would exceed max_supply");
+        }
+
         let key = DataKey::Balance(to.clone());
         let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(balance + amount));
 
-        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
+        env.storage().instance().set(&DataKey::TotalSupply, &new_supply);
 
         env.events().publish((symbol_short!("mint"), to.clone()), amount);
     }
@@ -224,7 +266,7 @@ impl TokenContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{testutils::Address as _, Env, IntoVal};
 
     fn setup() -> (Env, TokenContractClient<'static>, Address, Address) {
         let env = Env::default();
@@ -242,6 +284,7 @@ mod test {
             &String::from_str(&env, "TestToken"),
             &String::from_str(&env, "TST"),
             &1_000_000_0000000i128, // 1M tokens with 7 decimals
+            &None,
         );
 
         (env, client, admin, user)
@@ -268,6 +311,7 @@ mod test {
             &String::from_str(&env, "Dup"),
             &String::from_str(&env, "DUP"),
             &0i128,
+            &None,
         );
     }
 
@@ -371,5 +415,163 @@ mod test {
         // Admin can still mint before acceptance
         client.mint(&user, &1i128);
         assert_eq!(client.admin(), admin);
+    }
+  
+    // ── Freeze / Unfreeze tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_freeze_and_is_frozen() {
+        let (_, client, _, user) = setup();
+        assert!(!client.is_frozen(&user));
+        client.freeze_account(&user);
+        assert!(client.is_frozen(&user));
+    }
+
+    #[test]
+    #[should_panic(expected = "account is frozen")]
+    fn test_frozen_transfer_blocked() {
+        let (_, client, admin, user) = setup();
+        client.transfer(&admin, &user, &1000i128);
+        client.freeze_account(&user);
+        // This should panic because `user` is frozen.
+        client.transfer(&user, &admin, &500i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "account is frozen")]
+    fn test_frozen_transfer_from_blocked() {
+        let (env, client, admin, user) = setup();
+        let spender = Address::generate(&env);
+        // Give user some tokens and approve spender.
+        client.transfer(&admin, &user, &1000i128);
+        client.approve(&user, &spender, &1000i128, &0u32);
+        // Freeze user, then attempt transfer_from.
+        client.freeze_account(&user);
+        client.transfer_from(&spender, &user, &admin, &500i128);
+    }
+
+    #[test]
+    fn test_unfreeze_restores_transfer() {
+        let (_, client, admin, user) = setup();
+        client.transfer(&admin, &user, &1000i128);
+        client.freeze_account(&user);
+        assert!(client.is_frozen(&user));
+        client.unfreeze_account(&user);
+        assert!(!client.is_frozen(&user));
+        // Transfer should now succeed.
+        client.transfer(&user, &admin, &500i128);
+        assert_eq!(client.balance(&user), 500i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_non_admin_cannot_freeze() {
+        let env = Env::default();
+        // Do NOT mock all auths — we want real auth checks.
+        let contract_id = env.register_contract(None, TokenContract);
+        let client = TokenContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(
+            &admin,
+            &7u32,
+            &String::from_str(&env, "TestToken"),
+            &String::from_str(&env, "TST"),
+            &0i128,
+        );
+
+        // Remove mock — only user will auth, not admin.
+        env.mock_auths(&[
+            soroban_sdk::testutils::MockAuth {
+                address: &user,
+                invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "freeze_account",
+                    args: (&user,).into_val(&env),
+                    sub_invokes: &[],
+                },
+            },
+        ]);
+        // Should panic — user is not admin.
+        client.freeze_account(&user);
+    }
+    // ── max_supply tests ────────────────────────────────────────────────    
+    fn setup_with_cap() -> (Env, TokenContractClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, TokenContract);
+        let client = TokenContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        client.initialize(
+            &admin,
+            &7u32,
+            &String::from_str(&env, "CappedToken"),
+            &String::from_str(&env, "CAP"),
+            &500_0000000i128,
+            &Some(1_000_0000000i128),
+        );
+
+        (env, client, admin, user)
+    }
+
+    #[test]
+    fn test_max_supply_getter_none() {
+        let (_, client, _, _) = setup();
+        assert_eq!(client.max_supply(), None);
+    }
+
+    #[test]
+    fn test_max_supply_getter_some() {
+        let (_, client, _, _) = setup_with_cap();
+        assert_eq!(client.max_supply(), Some(1_000_0000000i128));
+    }
+
+    #[test]
+    fn test_mint_within_max_supply() {
+        let (_, client, _, user) = setup_with_cap();
+        client.mint(&user, &500_0000000i128);
+        assert_eq!(client.total_supply(), 1_000_0000000i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "mint would exceed max_supply")]
+    fn test_mint_exceeds_max_supply() {
+        let (_, client, _, user) = setup_with_cap();
+        client.mint(&user, &500_0000001i128);
+    }
+
+    #[test]
+    fn test_mint_exact_max_supply() {
+        let (_, client, _, user) = setup_with_cap();
+        // Mint exactly to the cap boundary
+        client.mint(&user, &500_0000000i128);
+        assert_eq!(client.total_supply(), 1_000_0000000i128);
+        assert_eq!(client.max_supply(), Some(1_000_0000000i128));
+    }
+
+    #[test]
+    #[should_panic(expected = "initial_supply exceeds max_supply")]
+    fn test_initial_supply_exceeds_max_supply() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, TokenContract);
+        let client = TokenContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        client.initialize(
+            &admin,
+            &7u32,
+            &String::from_str(&env, "Bad"),
+            &String::from_str(&env, "BAD"),
+            &2_000_0000000i128,
+            &Some(1_000_0000000i128),
+        );
     }
 }
